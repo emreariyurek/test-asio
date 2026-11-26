@@ -1,535 +1,608 @@
-#include <gtest/gtest.h>
+#pragma once
 
+#include <array>
 #include <atomic>
-#include <chrono>
-#include <cmath>
+#include <bit>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <expected>
+#include <deque>
 #include <functional>
-#include <limits>
+#include <memory>
 #include <span>
-#include <string>
-#include <string_view>
 #include <thread>
-#include <variant>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <boost/asio.hpp>
+#include <boost/asio/awaitable.hpp>
+#include <boost/lockfree/spsc_queue.hpp>
 
-#include "netkit/proto_parser.hpp"
-#include "netkit/tcp_server.hpp"
-
-namespace {
+namespace net {
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 
 // ============================================================================
-// 1. Test Yardımcıları ve Sahte (Fake) Protobuf Mesajları
+// 1. Byte Order & FrameCodec Sözleşmesi
 // ============================================================================
 
-struct FakeItem {
-  const std::string& sku() const { return sku_; }
-  double price() const { return price_; }
-  std::string sku_;
-  double price_ = 0.0;
+inline constexpr std::uint32_t ToHost32(std::uint32_t v) noexcept {
+  return (std::endian::native == std::endian::little) ? std::byteswap(v) : v;
+}
+
+inline constexpr std::uint32_t ToNet32(std::uint32_t v) noexcept {
+  return ToHost32(v);
+}
+
+struct NoMeta {};
+
+struct MsgIdMeta {
+  std::uint32_t msg_id = 0;
 };
 
-struct FakeAddress {
-  const std::string& city() const { return city_; }
-  std::string city_;
+template <typename Meta>
+struct DecodedHeader {
+  Meta meta{};
+  std::uint32_t payload_len = 0;
 };
 
-struct FakeCard {
-  const std::string& last4() const { return last4_; }
-  std::string last4_;
+template <typename C>
+concept FrameCodec = requires(
+    std::span<const std::byte, C::kHeaderSize> in_hdr,
+    std::span<std::byte, C::kHeaderSize> out_hdr,
+    const typename C::Meta& meta, std::uint32_t payload_len) {
+  typename C::Meta;
+  { C::kHeaderSize } -> std::convertible_to<std::size_t>;
+  { C::DecodeHeader(in_hdr) } -> std::same_as<DecodedHeader<typename C::Meta>>;
+  { C::EncodeHeader(out_hdr, meta, payload_len) } -> std::same_as<void>;
 };
 
-struct FakeOrder {
-  enum PaymentCase { PAYMENT_NOT_SET = 0, kCard = 1 };
+// Format 1: [4B len (BE)] + [proto]
+struct LengthCodec {
+  using Meta = NoMeta;
+  static constexpr std::size_t kHeaderSize = sizeof(std::uint32_t);
 
-  // Test kolaylığı: ham byte'lar "BAD" ise parse hatası simüle eder,
-  // aksi halde sabit geçerli/test edilebilir alanlarla doldurur.
-  bool ParseFromArray(const void* data, int size) {
-    if (size == 3 && std::memcmp(data, "BAD", 3) == 0) return false;
-    if (size == 4 && std::memcmp(data, "ZERO", 4) == 0) {
-      id_ = 0;  // Validasyon hatasını tetikler
-      return true;
-    }
-    id_ = 42;
-    score_ = 10.0;
-    has_addr_ = true;
-    addr_.city_ = "Ankara";
-    items_ = {FakeItem{.sku_ = "SKU-1", .price_ = 50.0}};
-    payment_case_ = kCard;
-    card_.last4_ = "1234";
-    start_time_ = 100;
-    end_time_ = 200;
-    return true;
+  static DecodedHeader<Meta> DecodeHeader(
+      std::span<const std::byte, kHeaderSize> hdr) noexcept {
+    std::uint32_t net_len = 0;
+    std::memcpy(&net_len, hdr.data(), sizeof(net_len));
+    return DecodedHeader<Meta>{.meta = {}, .payload_len = ToHost32(net_len)};
   }
 
-  std::size_t ByteSizeLong() const { return raw_payload_.size(); }
-  bool SerializeToArray(void* out, int size) const {
-    if (size > 0) std::memcpy(out, raw_payload_.data(), static_cast<std::size_t>(size));
-    return true;
-  }
-
-  std::uint64_t id() const { return id_; }
-  double score() const { return score_; }
-  bool has_addr() const { return has_addr_; }
-  const FakeAddress& addr() const { return addr_; }
-  bool has_coupon() const { return has_coupon_; }
-  const std::string& coupon() const { return coupon_; }
-  const std::vector<FakeItem>& items() const { return items_; }
-  PaymentCase payment_case() const { return payment_case_; }
-  const FakeCard& card() const { return card_; }
-  std::int64_t start_time() const { return start_time_; }
-  std::int64_t end_time() const { return end_time_; }
-
-  std::uint64_t id_ = 1;
-  double score_ = 0.0;
-  bool has_addr_ = true;
-  FakeAddress addr_{.city_ = "Ankara"};
-  bool has_coupon_ = false;
-  std::string coupon_;
-  std::vector<FakeItem> items_{FakeItem{.sku_ = "A1", .price_ = 10.0}};
-  PaymentCase payment_case_ = kCard;
-  FakeCard card_{.last4_ = "4242"};
-  std::int64_t start_time_ = 10;
-  std::int64_t end_time_ = 20;
-  std::string raw_payload_;
-};
-
-// Basit Echo / Wire mesajı (TcpServer testleri için)
-struct WireBlob {
-  std::string data;
-  std::size_t ByteSizeLong() const { return data.size(); }
-  bool SerializeToArray(void* out, int size) const {
-    if (size > 0) std::memcpy(out, data.data(), static_cast<std::size_t>(size));
-    return true;
+  static void EncodeHeader(std::span<std::byte, kHeaderSize> out, const Meta&,
+                           std::uint32_t payload_len) noexcept {
+    const std::uint32_t net_len = ToNet32(payload_len);
+    std::memcpy(out.data(), &net_len, sizeof(net_len));
   }
 };
 
-using namespace proto;
+// Format 2: [4B msg_id (BE)] + [4B len (BE)] + [proto]
+struct MsgIdLengthCodec {
+  using Meta = MsgIdMeta;
+  static constexpr std::size_t kHeaderSize = 2 * sizeof(std::uint32_t);
 
-inline constexpr Spec kAddrSpec{
-    Rule<&FakeAddress::city>("city", NotEmpty{}),
+  static DecodedHeader<Meta> DecodeHeader(
+      std::span<const std::byte, kHeaderSize> hdr) noexcept {
+    std::uint32_t net_id = 0;
+    std::uint32_t net_len = 0;
+    std::memcpy(&net_id, hdr.data(), sizeof(net_id));
+    std::memcpy(&net_len, hdr.data() + sizeof(net_id), sizeof(net_len));
+    return DecodedHeader<Meta>{
+        .meta = MsgIdMeta{.msg_id = ToHost32(net_id)},
+        .payload_len = ToHost32(net_len),
+    };
+  }
+
+  static void EncodeHeader(std::span<std::byte, kHeaderSize> out,
+                           const Meta& meta,
+                           std::uint32_t payload_len) noexcept {
+    const std::uint32_t net_id = ToNet32(meta.msg_id);
+    const std::uint32_t net_len = ToNet32(payload_len);
+    std::memcpy(out.data(), &net_id, sizeof(net_id));
+    std::memcpy(out.data() + sizeof(net_id), &net_len, sizeof(net_len));
+  }
 };
 
-inline constexpr Spec kItemSpec{
-    Rule<&FakeItem::sku>("sku", NotEmpty{}),
-    Rule<&FakeItem::price>("price", Between<double>{0.01, 10'000.0}),
+// ============================================================================
+// 2. Sunucu Konfigürasyonu & Session<Codec>
+// ============================================================================
+
+struct ServerConfig {
+  std::uint16_t port = 9000;
+  std::size_t worker_threads = 4;       // 0 = inline (unit test), >0 = sharded SPSC
+  std::uint32_t max_frame_size = 64 * 1024;
+  std::size_t read_buf_capacity = 128 * 1024;
+  std::size_t queue_capacity = 16384;   // Worker başına boost::lockfree::spsc_queue kapasitesi
 };
 
-inline constexpr Spec kCardSpec{
-    Rule<&FakeCard::last4>("last4", NotEmpty{}),
-};
+template <FrameCodec Codec>
+class TcpServer;
 
-inline constexpr Spec kOrderSpec{
-    Rule<&FakeOrder::id>("id", Between<std::uint64_t>{1, 1'000'000}),
-    Rule<&FakeOrder::score>("score", Between<double>{-100.0, 100.0}),
-    Required<&FakeOrder::has_addr, &FakeOrder::addr>("addr", Nested<kAddrSpec>{}),
-    Optional<&FakeOrder::has_coupon, &FakeOrder::coupon>("coupon", NotEmpty{}),
-    Rule<[](const FakeOrder& o) -> const auto& { return o.items(); }>(
-        "items", SizeBetween{1, 10}, Each<kItemSpec>{}),
-    OneOf<&FakeOrder::payment_case, /*IsRequired=*/true>(
-        "payment", OneOfCase<FakeOrder::kCard, &FakeOrder::card, kCardSpec>{}),
-    CrossField("end_time", "must be greater than start_time",
-               [](const FakeOrder& o) { return o.end_time() > o.start_time(); }),
-};
+template <FrameCodec Codec>
+class Session : public std::enable_shared_from_this<Session<Codec>> {
+ public:
+  using Meta = typename Codec::Meta;
 
-// Ham string -> std::span<const std::byte> yardımcısı
-std::vector<std::byte> ToBytes(std::string_view sv) {
-  std::vector<std::byte> out(sv.size());
-  if (!sv.empty()) std::memcpy(out.data(), sv.data(), sv.size());
-  return out;
-}
+  std::uint64_t Id() const noexcept { return id_; }
 
-std::string FromBytes(std::span<const std::byte> s) {
-  return std::string(reinterpret_cast<const char*>(s.data()), s.size());
-}
-
-// Codec'e göre tek frame paketleyen genel yardımcı
-template <net::FrameCodec Codec>
-std::vector<std::byte> EncodeFrame(const typename Codec::Meta& meta,
-                                   std::string_view payload) {
-  std::vector<std::byte> buf(Codec::kHeaderSize + payload.size());
-  Codec::EncodeHeader(
-      std::span<std::byte, Codec::kHeaderSize>{buf.data(), Codec::kHeaderSize},
-      meta, static_cast<std::uint32_t>(payload.size()));
-  if (!payload.empty()) {
-    std::memcpy(buf.data() + Codec::kHeaderSize, payload.data(), payload.size());
-  }
-  return buf;
-}
-
-// ============================================================================
-// 2. Value-Parameterized Testler: NaN/Inf Güvenli Between & BetweenApprox
-// ============================================================================
-
-struct DoubleRangeCase {
-  std::string name;
-  double value;
-  bool expected_ok;
-};
-
-class BetweenDoubleTest : public ::testing::TestWithParam<DoubleRangeCase> {};
-
-TEST_P(BetweenDoubleTest, EvaluatesRangeAndSpecialFloats) {
-  const auto& tc = GetParam();
-  constexpr Between<double> rule{-10.0, 10.0};
-  ValidationError err;
-
-  EXPECT_EQ(rule("v", tc.value, err), tc.expected_ok);
-  if (!tc.expected_ok) {
-    EXPECT_EQ(err.FormatPath(), "v");
-    EXPECT_EQ(err.reason, "out of range");
-  }
-}
-
-INSTANTIATE_TEST_SUITE_P(
-    RangeEdgeCases, BetweenDoubleTest,
-    ::testing::Values(
-        DoubleRangeCase{"Inside", 0.0, true},
-        DoubleRangeCase{"MinBoundary", -10.0, true},
-        DoubleRangeCase{"MaxBoundary", 10.0, true},
-        DoubleRangeCase{"BelowMin", -10.0001, false},
-        DoubleRangeCase{"AboveMax", 10.0001, false},
-        DoubleRangeCase{"QuietNaN", std::numeric_limits<double>::quiet_NaN(), false},
-        DoubleRangeCase{"PosInf", std::numeric_limits<double>::infinity(), false},
-        DoubleRangeCase{"NegInf", -std::numeric_limits<double>::infinity(), false}),
-    [](const auto& info) { return info.param.name; });
-
-TEST(BetweenApproxTest, AcceptsWithinEpsilonAndRejectsNaN) {
-  constexpr BetweenApprox<double> rule{-90.0, 90.0, 1e-6};
-  ValidationError err;
-  EXPECT_TRUE(rule("lat", 90.0 + 5e-7, err));
-  EXPECT_FALSE(rule("lat", 90.0 + 2e-6, err));
-  EXPECT_FALSE(rule("lat", std::numeric_limits<double>::quiet_NaN(), err));
-}
-
-// ============================================================================
-// 3. Value-Parameterized Testler: Spec Validasyon & Unwinding FieldPath
-// ============================================================================
-
-struct ValidationCase {
-  std::string name;
-  std::function<void(FakeOrder&)> mutate;
-  bool expected_ok;
-  std::string expected_path;
-  std::string expected_reason;
-};
-
-class OrderSpecValidationTest : public ::testing::TestWithParam<ValidationCase> {};
-
-TEST_P(OrderSpecValidationTest, ValidatesAndUnwindsPath) {
-  const auto& tc = GetParam();
-  FakeOrder order;  // Varsayılan olarak tüm kurallardan geçen geçerli sipariş
-  tc.mutate(order);
-
-  auto res = kOrderSpec.Validate(order);
-  ASSERT_EQ(res.has_value(), tc.expected_ok);
-
-  if (!tc.expected_ok) {
-    EXPECT_EQ(res.error().FormatPath(), tc.expected_path);
-    EXPECT_EQ(res.error().reason, tc.expected_reason);
-  }
-}
-
-INSTANTIATE_TEST_SUITE_P(
-    SpecRules, OrderSpecValidationTest,
-    ::testing::Values(
-        ValidationCase{"ValidDefault", [](FakeOrder&) {}, true, "", ""},
-        ValidationCase{"OptionalCouponValid",
-                       [](FakeOrder& o) {
-                         o.has_coupon_ = true;
-                         o.coupon_ = "SAVE10";
-                       },
-                       true, "", ""},
-        ValidationCase{"OptionalCouponEmptyFails",
-                       [](FakeOrder& o) {
-                         o.has_coupon_ = true;
-                         o.coupon_.clear();
-                       },
-                       false, "coupon", "must not be empty"},
-        ValidationCase{"RequiredAddrMissing",
-                       [](FakeOrder& o) { o.has_addr_ = false; }, false, "addr",
-                       "required field missing"},
-        ValidationCase{"NestedAddrCityEmpty",
-                       [](FakeOrder& o) { o.addr_.city_.clear(); }, false,
-                       "addr.city", "must not be empty"},
-        ValidationCase{"RepeatedEmptyFails",
-                       [](FakeOrder& o) { o.items_.clear(); }, false, "items",
-                       "invalid item count"},
-        ValidationCase{"RepeatedSecondItemPriceInvalid",
-                       [](FakeOrder& o) {
-                         o.items_.push_back(FakeItem{.sku_ = "B2", .price_ = -5.0});
-                       },
-                       false, "items[1].price", "out of range"},
-        ValidationCase{"OneOfMissingFails",
-                       [](FakeOrder& o) {
-                         o.payment_case_ = FakeOrder::PAYMENT_NOT_SET;
-                       },
-                       false, "payment", "oneof must be set"},
-        ValidationCase{"OneOfNestedCardEmptyFails",
-                       [](FakeOrder& o) { o.card_.last4_.clear(); }, false,
-                       "payment.last4", "must not be empty"},
-        ValidationCase{"CrossFieldTimeRangeFails",
-                       [](FakeOrder& o) {
-                         o.start_time_ = 500;
-                         o.end_time_ = 400;
-                       },
-                       false, "end_time", "must be greater than start_time"}),
-    [](const auto& info) { return info.param.name; });
-
-// ============================================================================
-// 4. Fixture Test: ProtoParser (Parse -> Validate -> Map & Arena Yeniden Kullanımı)
-// ============================================================================
-
-class ProtoParserTest : public ::testing::Test {
- protected:
-  ProtoParser parser_;
-};
-
-TEST_F(ProtoParserTest, ReturnsParseErrorOnCorruptBytes) {
-  auto res = parser_.Parse<FakeOrder, kOrderSpec>(
-      ToBytes("BAD"), [](const FakeOrder& o) { return o.id(); });
-  ASSERT_FALSE(res.has_value());
-  EXPECT_TRUE(std::holds_alternative<ParseError>(res.error()));
-}
-
-TEST_F(ProtoParserTest, ReturnsValidationErrorWhenSpecFails) {
-  auto res = parser_.Parse<FakeOrder, kOrderSpec>(
-      ToBytes("ZERO"), [](const FakeOrder& o) { return o.id(); });
-  ASSERT_FALSE(res.has_value());
-  ASSERT_TRUE(std::holds_alternative<ValidationError>(res.error()));
-  EXPECT_EQ(std::get<ValidationError>(res.error()).FormatPath(), "id");
-}
-
-TEST_F(ProtoParserTest, SupportsFallibleMapperReturningExpected) {
-  auto res = parser_.Parse<FakeOrder, kOrderSpec>(
-      ToBytes("OK"),
-      [](const FakeOrder&) -> std::expected<int, MappingError> {
-        return std::unexpected(MappingError{"unknown currency"});
-      });
-  ASSERT_FALSE(res.has_value());
-  ASSERT_TRUE(std::holds_alternative<MappingError>(res.error()));
-  EXPECT_EQ(std::get<MappingError>(res.error()).reason, "unknown currency");
-}
-
-TEST_F(ProtoParserTest, ReusesArenaAcrossRepeatedSuccessfulCalls) {
-  for (int i = 0; i < 100; ++i) {
-    auto res = parser_.Parse<FakeOrder, kOrderSpec>(
-        ToBytes("OK"), [](const FakeOrder& o) { return o.id(); });
-    ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(*res, 42u);
-  }
-}
-
-// ============================================================================
-// 5. Typed Testler: LengthCodec & MsgIdLengthCodec (Tek Test, İki Codec)
-// ============================================================================
-
-template <typename Codec>
-class CodecTypedTest : public ::testing::Test {};
-
-using TestedCodecs = ::testing::Types<net::LengthCodec, net::MsgIdLengthCodec>;
-TYPED_TEST_SUITE(CodecTypedTest, TestedCodecs);
-
-TYPED_TEST(CodecTypedTest, HeaderEncodeDecodeRoundTrip) {
-  using Codec = TypeParam;
-  typename Codec::Meta meta{};
-  if constexpr (std::same_as<typename Codec::Meta, net::MsgIdMeta>) {
-    meta.msg_id = 0x1234ABCD;
+  // LengthCodec kullanan servisler için: session->Send(reply_proto)
+  template <typename OutProto>
+    requires std::same_as<Meta, NoMeta>
+  void Send(const OutProto& msg) {
+    SendWithMeta(NoMeta{}, msg);
   }
 
-  std::array<std::byte, Codec::kHeaderSize> wire{};
-  Codec::EncodeHeader(wire, meta, 65'432);
-  auto decoded = Codec::DecodeHeader(wire);
-
-  EXPECT_EQ(decoded.payload_len, 65'432u);
-  if constexpr (std::same_as<typename Codec::Meta, net::MsgIdMeta>) {
-    EXPECT_EQ(decoded.meta.msg_id, 0x1234ABCDu);
+  // MsgIdLengthCodec kullanan servisler için: session->Send(msg_id, reply_proto)
+  template <typename OutProto>
+    requires std::same_as<Meta, MsgIdMeta>
+  void Send(std::uint32_t msg_id, const OutProto& msg) {
+    SendWithMeta(MsgIdMeta{.msg_id = msg_id}, msg);
   }
-}
 
-// ============================================================================
-// 6. Lock-Free SpscQueue Testleri
-// ============================================================================
+  // Herhangi bir özel Codec için genel metot
+  template <typename OutProto>
+  void SendWithMeta(const Meta& meta, const OutProto& msg) {
+    const std::uint32_t payload_len =
+        static_cast<std::uint32_t>(msg.ByteSizeLong());
+    std::vector<std::byte> frame(Codec::kHeaderSize + payload_len);
 
-TEST(SpscQueueTest, PreservesFifoAndRejectsWhenFull) {
-  // Kapasite 4 (1 slot ring-buffer doluluk ayrımı için kullanılır -> max 3 öğe)
-  net::detail::SpscQueue<int> q(4);
-  EXPECT_TRUE(q.TryPush(10));
-  EXPECT_TRUE(q.TryPush(20));
-  EXPECT_TRUE(q.TryPush(30));
-  EXPECT_FALSE(q.TryPush(40));  // Kuyruk dolu: non-blocking false
+    Codec::EncodeHeader(
+        std::span<std::byte, Codec::kHeaderSize>{frame.data(),
+                                                 Codec::kHeaderSize},
+        meta, payload_len);
 
-  int v = 0;
-  ASSERT_TRUE(q.TryPop(v));
-  EXPECT_EQ(v, 10);
-  ASSERT_TRUE(q.TryPop(v));
-  EXPECT_EQ(v, 20);
-  ASSERT_TRUE(q.TryPop(v));
-  EXPECT_EQ(v, 30);
-  EXPECT_FALSE(q.TryPop(v));
-}
-
-TEST(SpscQueueTest, ProducerConsumerDrainsAllItemsOnGracefulStop) {
-  constexpr int kCount = 20'000;
-  net::detail::SpscQueue<int> q(1024);
-  std::vector<int> received;
-  received.reserve(kCount);
-
-  std::jthread consumer([&] {
-    int item = 0;
-    while (q.WaitAndPop(item)) {
-      received.push_back(item);
-    }
-  });
-
-  for (int i = 0; i < kCount; ++i) {
-    while (!q.TryPush(int{i})) {
-      std::this_thread::yield();
-    }
-  }
-  q.RequestStop(/*drain=*/true);
-  consumer.join();
-
-  ASSERT_EQ(received.size(), static_cast<std::size_t>(kCount));
-  for (int i = 0; i < kCount; ++i) {
-    EXPECT_EQ(received[i], i);
-  }
-}
-
-// ============================================================================
-// 7. Value-Parameterized Entegrasyon Testleri: TcpServer (Inline vs Worker Modu)
-// ============================================================================
-
-class TcpServerModeTest : public ::testing::TestWithParam<std::size_t> {
- protected:
-  // Tek bir yardımcı: sunucuyu arka plan io_context thread'inde başlatır,
-  // client ile iletişim bittikten sonra temizce durdurur.
-  template <net::FrameCodec Codec>
-  struct Harness {
-    asio::io_context io_ctx;
-    net::TcpServer<Codec> server;
-    std::jthread io_thread;
-
-    explicit Harness(std::size_t worker_threads)
-        : server(io_ctx, net::ServerConfig{
-                             .port = 0,  // OS boş port atar
-                             .worker_threads = worker_threads,
-                             .max_frame_size = 4096,
-                             .queue_capacity = 256,
-                         }) {}
-
-    void Start() {
-      server.Start();
-      io_thread = std::jthread([this] { io_ctx.run(); });
+    if (payload_len > 0) {
+      msg.SerializeToArray(frame.data() + Codec::kHeaderSize,
+                           static_cast<int>(payload_len));
     }
 
-    void Stop() {
-      server.Stop();
-      if (io_thread.joinable()) io_thread.join();
-    }
-
-    ~Harness() {
-      server.ForceStop();
-      io_ctx.stop();
-    }
-  };
-
-  static tcp::socket ConnectClient(asio::io_context& client_io,
-                                   std::uint16_t port) {
-    tcp::socket sock(client_io);
-    sock.connect(tcp::endpoint{asio::ip::make_address("127.0.0.1"), port});
-    return sock;
+    SendRaw(std::move(frame));
   }
 
-  template <net::FrameCodec Codec>
-  static std::pair<typename Codec::Meta, std::string> ReadFrame(
-      tcp::socket& sock) {
-    std::array<std::byte, Codec::kHeaderSize> hdr_buf{};
-    asio::read(sock, asio::buffer(hdr_buf));
-    auto hdr = Codec::DecodeHeader(hdr_buf);
-
-    std::string body(hdr.payload_len, '\0');
-    if (hdr.payload_len > 0) {
-      asio::read(sock, asio::buffer(body));
-    }
-    return {hdr.meta, std::move(body)};
+  // Thread-safe: herhangi bir worker thread'inden çağrılabilir
+  void SendRaw(std::vector<std::byte> frame) {
+    auto self = this->shared_from_this();
+    asio::post(socket_.get_executor(),
+               [self = std::move(self), f = std::move(frame)]() mutable {
+                 if (self->force_closed_) return;
+                 const bool write_idle = self->write_queue_.empty();
+                 self->write_queue_.push_back(std::move(f));
+                 if (write_idle) {
+                   self->DoWrite();
+                 }
+               });
   }
+
+  // Bekleyen yazmaları gönderip bağlantıyı temizce kapatır (thread-safe)
+  void Close() {
+    auto self = this->shared_from_this();
+    asio::post(socket_.get_executor(),
+               [self = std::move(self)]() { self->GracefulCloseOnIo(); });
+  }
+
+ private:
+  friend class TcpServer<Codec>;
+
+  Session(std::uint64_t id, tcp::socket socket, std::uint32_t max_frame_size,
+          std::size_t read_buf_capacity)
+      : id_(id),
+        socket_(std::move(socket)),
+        max_frame_size_(max_frame_size),
+        read_buf_(read_buf_capacity) {}
+
+  template <typename OnFrameFn, typename OnDisconnectFn>
+  void StartRead(OnFrameFn&& on_frame, OnDisconnectFn&& on_disconnect) {
+    auto self = this->shared_from_this();
+    asio::co_spawn(
+        socket_.get_executor(),
+        [self = std::move(self), on_frame = std::forward<OnFrameFn>(on_frame),
+         on_disconnect = std::forward<OnDisconnectFn>(
+             on_disconnect)]() mutable -> asio::awaitable<void> {
+          co_await self->ReadLoop(on_frame);
+          on_disconnect(self);
+        },
+        asio::detached);
+  }
+
+  template <typename OnFrameFn>
+  asio::awaitable<void> ReadLoop(OnFrameFn& on_frame) {
+    constexpr std::size_t kHeaderSize = Codec::kHeaderSize;
+    const std::size_t capacity = read_buf_.size();
+    std::size_t read_pos = 0;
+    std::size_t write_pos = 0;
+
+    try {
+      for (;;) {
+        if (capacity - write_pos < 4096) {
+          const std::size_t remaining = write_pos - read_pos;
+          if (remaining > 0 && read_pos > 0) {
+            std::memmove(read_buf_.data(), read_buf_.data() + read_pos,
+                         remaining);
+          }
+          read_pos = 0;
+          write_pos = remaining;
+        }
+
+        const std::size_t bytes_read = co_await socket_.async_read_some(
+            asio::buffer(read_buf_.data() + write_pos, capacity - write_pos),
+            asio::use_awaitable);
+        write_pos += bytes_read;
+
+        for (;;) {
+          const std::size_t available = write_pos - read_pos;
+          if (available < kHeaderSize) break;
+
+          const auto hdr = Codec::DecodeHeader(
+              std::span<const std::byte, kHeaderSize>{
+                  read_buf_.data() + read_pos, kHeaderSize});
+          const std::uint32_t payload_len = hdr.payload_len;
+
+          if (payload_len == 0 || payload_len > max_frame_size_) [[unlikely]] {
+            co_return;
+          }
+          if (available < kHeaderSize + payload_len) break;
+
+          std::span<const std::byte> payload{
+              read_buf_.data() + read_pos + kHeaderSize, payload_len};
+          read_pos += kHeaderSize + payload_len;
+
+          if (read_pos == write_pos) {
+            read_pos = 0;
+            write_pos = 0;
+          }
+
+          on_frame(this->shared_from_this(), hdr.meta, payload);
+        }
+      }
+    } catch (const boost::system::system_error&) {
+      // EOF, shutdown veya bağlantı koptu
+    }
+  }
+
+  void DoWrite() {
+    auto self = this->shared_from_this();
+    const auto& front = write_queue_.front();
+    asio::async_write(
+        socket_, asio::buffer(front.data(), front.size()),
+        [self = std::move(self)](const boost::system::error_code& ec,
+                                 std::size_t) {
+          if (ec) [[unlikely]] {
+            self->write_queue_.clear();
+            self->CloseSocketIgnoreErrors();
+            return;
+          }
+          self->write_queue_.pop_front();
+          if (!self->write_queue_.empty()) {
+            self->DoWrite();
+          } else if (self->close_after_write_) {
+            self->CloseSocketIgnoreErrors();
+          }
+        });
+  }
+
+  // Yeni okuma durdurulur; worker'ların yollayacağı yanıtlar için yazma açık kalır
+  void StopReadingOnIo() {
+    boost::system::error_code ec;
+    socket_.shutdown(tcp::socket::shutdown_receive, ec);
+  }
+
+  // Bekleyen yazmalar bitince soketi kapatır
+  void GracefulCloseOnIo() {
+    StopReadingOnIo();
+    close_after_write_ = true;
+    if (write_queue_.empty()) {
+      CloseSocketIgnoreErrors();
+    }
+  }
+
+  void ForceCloseOnIo() {
+    force_closed_ = true;
+    write_queue_.clear();
+    CloseSocketIgnoreErrors();
+  }
+
+  void CloseSocketIgnoreErrors() {
+    boost::system::error_code ec;
+    if (socket_.is_open()) {
+      socket_.shutdown(tcp::socket::shutdown_both, ec);
+      socket_.close(ec);
+    }
+  }
+
+  std::uint64_t id_;
+  tcp::socket socket_;
+  std::uint32_t max_frame_size_;
+  std::vector<std::byte> read_buf_;
+  std::deque<std::vector<std::byte>> write_queue_;
+  bool close_after_write_ = false;
+  bool force_closed_ = false;
 };
 
-TEST_P(TcpServerModeTest, HandlesCoalescedAndFragmentedLengthFramesAndReplies) {
-  Harness<net::LengthCodec> h(GetParam());
+// ============================================================================
+// 3. Generic TcpServer<Codec> (Tek I/O Thread + Boost.Lockfree Sharded SPSC)
+// ============================================================================
 
-  h.server.OnFrame([](auto session, std::span<const std::byte> payload) {
-    session->Send(WireBlob{"ECHO:" + FromBytes(payload)});
-  });
-  h.Start();
+template <FrameCodec Codec = LengthCodec>
+class TcpServer {
+ public:
+  using SessionType = Session<Codec>;
+  using SessionPtr = std::shared_ptr<SessionType>;
+  using Meta = typename Codec::Meta;
 
-  asio::io_context client_io;
-  auto sock = ConnectClient(client_io, h.server.Port());
+  using FrameCallback = std::conditional_t<
+      std::same_as<Meta, NoMeta>,
+      std::function<void(SessionPtr, std::span<const std::byte>)>,
+      std::function<void(SessionPtr, Meta, std::span<const std::byte>)>>;
 
-  // 1) Coalesced: iki frame tek write ile bitişik gönderilir
-  auto f1 = EncodeFrame<net::LengthCodec>({}, "hello");
-  auto f2 = EncodeFrame<net::LengthCodec>({}, "world");
-  f1.insert(f1.end(), f2.begin(), f2.end());
-  asio::write(sock, asio::buffer(f1));
+  using DisconnectCallback = std::function<void(SessionPtr)>;
+  using DropCallback = std::function<void(SessionPtr, std::size_t)>;
 
-  // 2) Fragmented: tek frame 2 byte'lık parçalar halinde gönderilir
-  auto f3 = EncodeFrame<net::LengthCodec>({}, "fragmented_payload");
-  for (std::size_t i = 0; i < f3.size(); i += 2) {
-    const std::size_t n = std::min<std::size_t>(2, f3.size() - i);
-    asio::write(sock, asio::buffer(f3.data() + i, n));
+  TcpServer(asio::io_context& io_ctx, ServerConfig cfg)
+      : io_ctx_(io_ctx),
+        cfg_(cfg),
+        acceptor_(io_ctx) {
+    if (cfg_.read_buf_capacity < cfg_.max_frame_size + Codec::kHeaderSize) {
+      cfg_.read_buf_capacity = cfg_.max_frame_size + Codec::kHeaderSize;
+    }
   }
 
-  EXPECT_EQ(ReadFrame<net::LengthCodec>(sock).second, "ECHO:hello");
-  EXPECT_EQ(ReadFrame<net::LengthCodec>(sock).second, "ECHO:world");
-  EXPECT_EQ(ReadFrame<net::LengthCodec>(sock).second, "ECHO:fragmented_payload");
+  ~TcpServer() { ForceStop(); }
 
-  sock.close();
-  h.Stop();
-}
+  TcpServer(const TcpServer&) = delete;
+  TcpServer& operator=(const TcpServer&) = delete;
 
-TEST_P(TcpServerModeTest, RoutesMsgIdLengthCodecAndPreservesFifoOrder) {
-  Harness<net::MsgIdLengthCodec> h(GetParam());
+  void OnFrame(FrameCallback cb) { on_frame_ = std::move(cb); }
+  void OnDisconnect(DisconnectCallback cb) { on_disconnect_ = std::move(cb); }
+  void OnDrop(DropCallback cb) { on_drop_ = std::move(cb); }
 
-  h.server.OnFrame([](auto session, net::MsgIdMeta meta,
-                      std::span<const std::byte> payload) {
-    session->Send(meta.msg_id + 1, WireBlob{FromBytes(payload)});
-  });
-  h.Start();
-
-  asio::io_context client_io;
-  auto sock = ConnectClient(client_io, h.server.Port());
-
-  // Aynı bağlantıdan ardışık 20 paket: worker_threads > 0 olsa bile FIFO korunmalı
-  for (std::uint32_t i = 0; i < 20; ++i) {
-    auto frame = EncodeFrame<net::MsgIdLengthCodec>(
-        net::MsgIdMeta{.msg_id = 1000 + i}, "msg_" + std::to_string(i));
-    asio::write(sock, asio::buffer(frame));
+  std::uint64_t DroppedCount() const noexcept {
+    return dropped_count_.load(std::memory_order_relaxed);
   }
 
-  for (std::uint32_t i = 0; i < 20; ++i) {
-    auto [meta, body] = ReadFrame<net::MsgIdLengthCodec>(sock);
-    EXPECT_EQ(meta.msg_id, 1001 + i);
-    EXPECT_EQ(body, "msg_" + std::to_string(i));
+  // Ephemeral port (cfg.port == 0) kullanıldığında işletim sisteminin atadığı portu döner
+  std::uint16_t Port() const {
+    return acceptor_.is_open() ? acceptor_.local_endpoint().port() : cfg_.port;
   }
 
-  sock.close();
-  h.Stop();
-}
+  void Start() {
+    if (running_.exchange(true)) return;
 
-INSTANTIATE_TEST_SUITE_P(
-    InlineAndShardedWorkers, TcpServerModeTest,
-    ::testing::Values(std::size_t{0}, std::size_t{2}),
-    [](const auto& info) {
-      return info.param == 0 ? "InlineMode" : "TwoWorkerThreads";
+    tcp::endpoint ep{tcp::v4(), cfg_.port};
+    acceptor_.open(ep.protocol());
+    acceptor_.set_option(tcp::acceptor::reuse_address(true));
+    acceptor_.bind(ep);
+    acceptor_.listen();
+
+    // Sharded boost::lockfree::spsc_queue worker'larını başlat (0 ise inline mod)
+    if (cfg_.worker_threads > 0) {
+      workers_.reserve(cfg_.worker_threads);
+      for (std::size_t i = 0; i < cfg_.worker_threads; ++i) {
+        auto worker = std::make_unique<Worker>(cfg_.queue_capacity);
+        worker->thread = std::jthread([this, w = worker.get()] { WorkerLoop(*w); });
+        workers_.push_back(std::move(worker));
+      }
+    }
+
+    asio::co_spawn(
+        io_ctx_,
+        [this]() -> asio::awaitable<void> { co_await AcceptLoop(); },
+        asio::detached);
+  }
+
+  // Graceful Stop:
+  // 1) Yeni bağlantıları ve okumaları keser
+  // 2) Worker kuyruklarındaki bekleyen işleri bitirir (cevaplar Send() ile post edilir)
+  // 3) Bekleyen yazmalar bitince tüm soketleri temizce kapatır
+  void Stop() {
+    if (!running_.exchange(false)) return;
+
+    asio::post(io_ctx_, [this] {
+      boost::system::error_code ec;
+      acceptor_.close(ec);
+      for (auto& [id, weak] : sessions_) {
+        if (auto s = weak.lock()) {
+          s->StopReadingOnIo();
+        }
+      }
     });
 
-}  // namespace
+    StopWorkers(/*drain=*/true);
+
+    asio::post(io_ctx_, [this] {
+      for (auto& [id, weak] : sessions_) {
+        if (auto s = weak.lock()) {
+          s->GracefulCloseOnIo();
+        }
+      }
+    });
+  }
+
+  // Acil Stop: Kuyrukları ve yazmaları beklemeden anında durdurur
+  void ForceStop() {
+    const bool was_running = running_.exchange(false);
+    if (!was_running && workers_.empty()) return;
+
+    StopWorkers(/*drain=*/false);
+
+    asio::post(io_ctx_, [this] {
+      boost::system::error_code ec;
+      if (acceptor_.is_open()) acceptor_.close(ec);
+      for (auto& [id, weak] : sessions_) {
+        if (auto s = weak.lock()) {
+          s->ForceCloseOnIo();
+        }
+      }
+      sessions_.clear();
+    });
+  }
+
+ private:
+  struct WorkItem {
+    SessionPtr session;
+    Meta meta{};
+    std::vector<std::byte> payload;
+  };
+
+  struct Worker {
+    explicit Worker(std::size_t cap) : queue(cap) {}
+
+    bool TryPush(WorkItem&& item) {
+      if (!queue.push(std::move(item))) [[unlikely]] {
+        return false;
+      }
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (sleeping.load(std::memory_order_relaxed)) {
+        wake_seq.fetch_add(1, std::memory_order_release);
+        wake_seq.notify_one();
+      }
+      return true;
+    }
+
+    bool WaitAndPop(WorkItem& out) {
+      for (;;) {
+        for (int spin = 0; spin < 64; ++spin) {
+          if (queue.pop(out)) return true;
+          if (stop_immediate.load(std::memory_order_acquire)) return false;
+        }
+
+        const std::uint64_t seq = wake_seq.load(std::memory_order_acquire);
+        sleeping.store(true, std::memory_order_seq_cst);
+
+        if (queue.pop(out)) {
+          sleeping.store(false, std::memory_order_relaxed);
+          return true;
+        }
+        if (stop_immediate.load(std::memory_order_acquire) ||
+            stop_drain.load(std::memory_order_acquire)) {
+          sleeping.store(false, std::memory_order_relaxed);
+          return false;
+        }
+
+        wake_seq.wait(seq, std::memory_order_acquire);
+        sleeping.store(false, std::memory_order_relaxed);
+      }
+    }
+
+    void RequestStop(bool drain) {
+      if (drain) {
+        stop_drain.store(true, std::memory_order_seq_cst);
+      } else {
+        stop_immediate.store(true, std::memory_order_seq_cst);
+      }
+      wake_seq.fetch_add(1, std::memory_order_release);
+      wake_seq.notify_all();
+    }
+
+    boost::lockfree::spsc_queue<WorkItem> queue;
+    std::atomic<bool> sleeping{false};
+    std::atomic<std::uint64_t> wake_seq{0};
+    std::atomic<bool> stop_drain{false};
+    std::atomic<bool> stop_immediate{false};
+    std::jthread thread;
+  };
+
+  asio::awaitable<void> AcceptLoop() {
+    try {
+      for (;;) {
+        tcp::socket socket{io_ctx_};
+        co_await acceptor_.async_accept(socket, asio::use_awaitable);
+
+        boost::system::error_code ec;
+        socket.set_option(tcp::no_delay(true), ec);
+
+        const std::uint64_t id = ++next_session_id_;
+        auto session = std::shared_ptr<SessionType>(
+            new SessionType(id, std::move(socket), cfg_.max_frame_size,
+                            cfg_.read_buf_capacity));
+
+        sessions_.emplace(id, session);
+
+        session->StartRead(
+            [this](SessionPtr s, const Meta& meta,
+                   std::span<const std::byte> payload) {
+              DispatchFrame(std::move(s), meta, payload);
+            },
+            [this](SessionPtr s) {
+              sessions_.erase(s->Id());
+              if (on_disconnect_) {
+                on_disconnect_(std::move(s));
+              }
+            });
+      }
+    } catch (const boost::system::system_error&) {
+      // Acceptor kapatıldı (Stop / ForceStop)
+    }
+  }
+
+  void DispatchFrame(SessionPtr session, const Meta& meta,
+                     std::span<const std::byte> payload) {
+    if (!on_frame_) return;
+
+    // Inline mod (unit testler için worker_threads == 0)
+    if (workers_.empty()) {
+      InvokeOnFrame(std::move(session), meta, payload);
+      return;
+    }
+
+    // Aynı TCP bağlantısı hep aynı worker'a gider (FIFO sıra garantisi)
+    const std::size_t idx = session->Id() % workers_.size();
+    WorkItem item{
+        .session = session,
+        .meta = meta,
+        .payload = std::vector<std::byte>(payload.begin(), payload.end()),
+    };
+
+    // Non-blocking push: kuyruk dolarsa I/O thread asla bloklanmaz
+    if (!workers_[idx]->TryPush(std::move(item))) [[unlikely]] {
+      dropped_count_.fetch_add(1, std::memory_order_relaxed);
+      if (on_drop_) {
+        on_drop_(std::move(session), payload.size());
+      }
+    }
+  }
+
+  void WorkerLoop(Worker& worker) {
+    WorkItem item;
+    while (worker.WaitAndPop(item)) {
+      InvokeOnFrame(std::move(item.session), item.meta, item.payload);
+      item.session.reset();
+    }
+  }
+
+  void InvokeOnFrame(SessionPtr session, const Meta& meta,
+                     std::span<const std::byte> payload) {
+    if constexpr (std::same_as<Meta, NoMeta>) {
+      on_frame_(std::move(session), payload);
+    } else {
+      on_frame_(std::move(session), meta, payload);
+    }
+  }
+
+  void StopWorkers(bool drain) {
+    for (auto& w : workers_) {
+      w->RequestStop(drain);
+    }
+    workers_.clear();  // std::jthread yıkıcıları tüm worker'ları join eder
+  }
+
+  asio::io_context& io_ctx_;
+  ServerConfig cfg_;
+  tcp::acceptor acceptor_;
+
+  FrameCallback on_frame_;
+  DisconnectCallback on_disconnect_;
+  DropCallback on_drop_;
+
+  std::uint64_t next_session_id_ = 0;
+  std::unordered_map<std::uint64_t, std::weak_ptr<SessionType>> sessions_;
+
+  std::vector<std::unique_ptr<Worker>> workers_;
+  std::atomic<bool> running_{false};
+  std::atomic<std::uint64_t> dropped_count_{0};
+};
+
+}  // namespace net
